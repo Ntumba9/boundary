@@ -37,6 +37,8 @@ export function hostnameFromHostHeader(hostHeader: string | null | undefined): s
     const end = h.indexOf(']');
     return end === -1 ? h : h.slice(0, end + 1);
   }
+  // A bare IPv6 literal (more than one colon, no brackets) carries no port.
+  if (h.split(':').length > 2) return h;
   return h.split(':')[0];
 }
 

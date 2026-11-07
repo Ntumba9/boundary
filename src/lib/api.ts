@@ -26,9 +26,14 @@ export function authed<P extends Record<string, string> = Record<string, never>>
         verifyCsrf(req, auth);
       }
       const params = ctx?.params ? await ctx.params : ({} as P);
-      return await handler({ req, auth, params });
+      const res = await handler({ req, auth, params });
+      // Authenticated JSON is per-user; no cache, shared or browser, may store it.
+      res.headers.set('Cache-Control', 'no-store');
+      return res;
     } catch (err) {
-      return errorResponse(err, req);
+      const res = errorResponse(err, req);
+      res.headers.set('Cache-Control', 'no-store');
+      return res;
     }
   };
 }
@@ -49,6 +54,41 @@ function isMutation(method: string): boolean {
   return method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
 }
 
+// Well above the largest legitimate body (a 20 KB document body plus JSON
+// overhead), small enough to keep a buffered payload harmless.
+const MAX_JSON_BODY_BYTES = 64 * 1024;
+
+/**
+ * Read the request body with a hard byte cap. The declared Content-Length is
+ * checked first (cheap, covers honest clients), but it is only a hint: a
+ * chunked or forged-length request streams in without one, so the stream
+ * itself is also bounded and aborted the moment it exceeds the cap. Without
+ * this, req.json() would buffer an unbounded body into memory before zod ever
+ * ran.
+ */
+async function readBodyBounded(req: NextRequest): Promise<string> {
+  const declaredLength = req.headers.get('content-length');
+  if (declaredLength !== null && Number(declaredLength) > MAX_JSON_BODY_BYTES) {
+    throw new HttpError(413, 'Request body too large');
+  }
+  if (!req.body) return '';
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_JSON_BODY_BYTES) throw new HttpError(413, 'Request body too large');
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
 /**
  * Parse and validate a JSON body against a zod schema.
  * Schemas are `.strict()`, so unknown keys such as company_id, owner_user_id
@@ -62,8 +102,9 @@ export async function parseJson<S extends z.ZodType>(req: NextRequest, schema: S
   }
   let raw: unknown;
   try {
-    raw = await req.json();
-  } catch {
+    raw = JSON.parse(await readBodyBounded(req));
+  } catch (err) {
+    if (err instanceof HttpError) throw err; // the 413 from the bounded read
     throw new HttpError(400, 'Body is not valid JSON');
   }
   return schema.parse(raw);
