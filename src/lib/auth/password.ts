@@ -17,13 +17,15 @@ export async function verifyPassword(passwordHash: string, password: string): Pr
   }
 }
 
-let dummyHash: Promise<string> | undefined;
+let dummyHash: string | undefined;
 
 /**
  * Used when the email doesn't exist, so the response time for "unknown email"
  * is similar to "wrong password" (reduces user-enumeration via timing).
  */
 export async function burnPasswordCheck(password: string): Promise<void> {
-  dummyHash ??= hash('boundary-timing-equalizer-not-a-real-password');
-  await verifyPassword(await dummyHash, password);
+  // Cache the resolved hash, not the promise: a one-off hash failure must not
+  // poison every later unknown-email login with a permanently rejected promise.
+  dummyHash ??= await hash('boundary-timing-equalizer-not-a-real-password');
+  await verifyPassword(dummyHash, password);
 }

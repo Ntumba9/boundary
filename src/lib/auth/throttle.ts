@@ -41,26 +41,47 @@ export async function isLocked(key: string): Promise<boolean> {
   return rows[0]?.locked ?? false;
 }
 
+/**
+ * Record one failed attempt and lock the key at MAX_FAILURES, atomically.
+ *
+ * This is a single statement on purpose. The ON CONFLICT clause takes a row
+ * lock on the attempt_key row, so concurrent failures serialize: the counter
+ * cannot lose updates, and the lock is set in the same atomic step that
+ * crosses the threshold. The old two-statement version (increment, then a
+ * separate lock UPDATE when the returned count hit the max) had a
+ * check-then-act window in which parallel attempts could all pass the
+ * threshold check before any lock existed.
+ */
 export async function recordFailure(key: string): Promise<void> {
-  const { rows } = await query<{ failed_count: number }>(
+  // Same semantics as before, in one atomic step:
+  //   - counting window expired     -> restart at 1
+  //   - key currently locked        -> freeze the counter (isLocked() normally
+  //                                    short-circuits before this is reached)
+  //   - this failure hits the max   -> lock, reset the counter and window
+  //   - otherwise                   -> increment
+  await query(
     `INSERT INTO login_attempts (attempt_key, failed_count, window_start)
      VALUES ($1, 1, now())
      ON CONFLICT (attempt_key) DO UPDATE SET
-       failed_count = CASE WHEN login_attempts.window_start < now() - make_interval(mins => $2)
-                           THEN 1 ELSE login_attempts.failed_count + 1 END,
-       window_start = CASE WHEN login_attempts.window_start < now() - make_interval(mins => $2)
-                           THEN now() ELSE login_attempts.window_start END
-     RETURNING failed_count`,
-    [key, WINDOW_MINUTES],
+       failed_count = CASE
+         WHEN login_attempts.window_start < now() - make_interval(mins => $2) THEN 1
+         WHEN login_attempts.locked_until IS NOT NULL AND login_attempts.locked_until > now()
+           THEN login_attempts.failed_count
+         WHEN login_attempts.failed_count + 1 >= $3 THEN 0
+         ELSE login_attempts.failed_count + 1 END,
+       window_start = CASE
+         WHEN login_attempts.window_start < now() - make_interval(mins => $2) THEN now()
+         WHEN login_attempts.failed_count + 1 >= $3 THEN now()
+         ELSE login_attempts.window_start END,
+       locked_until = CASE
+         WHEN login_attempts.window_start < now() - make_interval(mins => $2)
+           THEN login_attempts.locked_until
+         WHEN login_attempts.locked_until IS NOT NULL AND login_attempts.locked_until > now()
+           THEN login_attempts.locked_until
+         WHEN login_attempts.failed_count + 1 >= $3 THEN now() + make_interval(mins => $4)
+         ELSE login_attempts.locked_until END`,
+    [key, WINDOW_MINUTES, MAX_FAILURES, LOCK_MINUTES],
   );
-  if ((rows[0]?.failed_count ?? 0) >= MAX_FAILURES) {
-    await query(
-      `UPDATE login_attempts
-          SET locked_until = now() + make_interval(mins => $2), failed_count = 0, window_start = now()
-        WHERE attempt_key = $1`,
-      [key, LOCK_MINUTES],
-    );
-  }
 }
 
 export async function clearFailures(key: string): Promise<void> {
