@@ -14,6 +14,7 @@ test('on only when both env vars, non-production and localhost host', () => {
   assert.equal(isUnsafeDemoEnabled(on, 'localhost:3000'), true);
   assert.equal(isUnsafeDemoEnabled(on, '127.0.0.1:3300'), true);
   assert.equal(isUnsafeDemoEnabled(on, '[::1]:3000'), true);
+  assert.equal(isUnsafeDemoEnabled(on, '::1'), true); // bare IPv6 loopback, no brackets or port
 });
 
 test('either env var alone is not enough', () => {
@@ -28,7 +29,19 @@ test('never in production', () => {
 });
 
 test('never for non-local hosts', () => {
-  for (const h of ['example.com', 'localhost.evil.com', '10.0.0.8:3000', 'evil.com:3000', '', null, undefined]) {
+  for (const h of [
+    'example.com',
+    'localhost.evil.com',
+    '10.0.0.8:3000',
+    'evil.com:3000',
+    'fe80::1', // IPv6, but not loopback
+    '0:0:0:0:0:0:0:1', // expanded ::1: not in the allowlist, stays OFF (stricter is fine)
+    '::1:3000', // parses as a non-loopback IPv6 literal, not ::1 with a port
+    '1:2:3:4:5:6:7:8',
+    '',
+    null,
+    undefined,
+  ]) {
     assert.equal(isUnsafeDemoEnabled(on, h), false, String(h));
   }
 });
@@ -36,5 +49,7 @@ test('never for non-local hosts', () => {
 test('host header parsing', () => {
   assert.equal(hostnameFromHostHeader('LocalHost:3000'), 'localhost');
   assert.equal(hostnameFromHostHeader('[::1]:8080'), '[::1]');
+  assert.equal(hostnameFromHostHeader('::1'), '::1');
+  assert.equal(hostnameFromHostHeader('fe80::1'), 'fe80::1');
   assert.equal(hostnameFromHostHeader(null), '');
 });
