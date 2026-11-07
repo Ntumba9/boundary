@@ -58,7 +58,7 @@ Seed data: Acme has 3 projects / 7 documents, Globex has 2 projects / 5 document
 ### Run the tests against the running dev server
 
 ```bash
-npm run test:authz            # authorization runner, safe mode: expect 62/62 PASS, exit 0
+npm run test:authz            # authorization runner, safe mode: expect 71/71 PASS, exit 0
 npm run test:smoke            # UI smoke tests (server-rendered HTML checks)
 npm run test:e2e              # Playwright browser tests (one-time: npx playwright install chromium)
 npm run test:unit             # pure unit tests, no server needed
@@ -119,12 +119,12 @@ Browser ──► Next.js App Router (one process)
   2. *Role/ownership* within the tenant is decided by `src/lib/permissions.ts`.
 
   A bug in layer 2 can at worst leak within one company, never across companies.
-- **Paginated lists.** `GET /api/projects/:id/documents` and `GET /api/admin/users` take `?limit=` (1-100, default 25) and `?cursor=`, validated by a strict zod schema (`src/lib/pagination.ts`; unknown params or a malformed cursor are 400), and return `{ items, nextCursor }`. The tenant filter and the `LIMIT` are in the same SQL statement, so rows are scoped to the caller's company *before* a page is cut, never filtered in memory afterwards. See [Performance notes](#performance-notes) for why it's keyset rather than offset.
+- **Paginated lists.** `GET /api/projects/:id/documents`, `GET /api/admin/users`, and `GET /api/admin/audit-log` take `?limit=` (1-100, default 25) and `?cursor=`, validated by a strict zod schema (`src/lib/pagination.ts`; unknown params or a malformed cursor are 400), and return `{ items, nextCursor }`. The tenant filter and the `LIMIT` are in the same SQL statement, so rows are scoped to the caller's company *before* a page is cut, never filtered in memory afterwards. See [Performance notes](#performance-notes) for why it's keyset rather than offset.
 - **Connection pool and shutdown.** `src/lib/db.ts` creates one `pg` Pool per process with explicit limits (10 connections, 30 s idle timeout, 5 s connect timeout so a dead DB fails requests instead of hanging them, 10 s `statement_timeout`) and an `error` listener, without which an idle client dropped by a DB restart would crash the process. `src/instrumentation.ts` ends the pool on `SIGTERM`/`SIGINT`. Next's own handler drains in-flight HTTP requests in parallel; the trade-off is documented in that file.
 
-### Data model (`db/migrations/001_init.sql`)
+### Data model (`db/migrations/001_init.sql`, `003_audit_log.sql`)
 
-`companies`, `users(company_id, email, password_hash, role, is_active)`, `sessions(user_id, token_hash, csrf_hash, expires_at)`, `projects(company_id, name)`, `documents(project_id, company_id, owner_user_id, title, body)`, `login_attempts`.
+`companies`, `users(company_id, email, password_hash, role, is_active)`, `sessions(user_id, token_hash, csrf_hash, expires_at)`, `projects(company_id, name)`, `documents(project_id, company_id, owner_user_id, title, body)`, `login_attempts`, `admin_audit_log(company_id, actor_user_id, target_user_id, action, old_value, new_value)`, `admin_mutation_attempts`.
 
 Deliberate defense-in-depth choices:
 
@@ -149,6 +149,7 @@ Each index matches a specific `WHERE` / `ORDER BY` in `src/lib/services/*` or `s
 | `users (company_id, created_at, id)` | Admin user list, keyset-paginated | Same pattern as documents. Replaces `(company_id)`. |
 | `projects (company_id, name)` | Dashboard: `WHERE company_id = $1 ORDER BY name` | Returns projects already sorted. Replaces `(company_id)`. |
 | `sessions (expires_at)` | `DELETE FROM sessions WHERE expires_at <= now()` (`npm run db:cleanup`) | Range scan of only the expired rows instead of a full scan of all sessions. |
+| `admin_audit_log (company_id, created_at, id)` | Audit log list: same tenant-filter-plus-keyset shape as documents/users | Same reasoning as the documents/users indexes above; added with the table in `003_audit_log.sql` rather than retrofitted. |
 
 Already in place from `001_init.sql` and deliberately not duplicated: `users (lower(email))` UNIQUE (login is `WHERE lower(email) = lower($1)`, so the index must be on the expression, not the bare column), `sessions (token_hash)` UNIQUE (every authenticated request), `sessions (user_id)` (deleting a deactivated user's sessions). Separate single-column indexes on `documents(company_id)` or `documents(project_id)` would be redundant: the composite index answers both as long as `company_id` is in the filter, and every document query has it.
 
@@ -186,6 +187,7 @@ Within the user's **own company only**. Nobody can act across companies, regardl
 | List users, create demo users                   | **no** (403)        | yes (new users always start as member) |
 | Change roles (member <-> admin)                 | **no** (403)        | yes (not their own role) |
 | Deactivate / reactivate users                   | **no** (403)        | yes (not themselves) |
+| Read the admin audit log                        | **no** (403)        | yes (own company only) |
 | Anything on another company's data              | **no** (404)        | **no** (404) |
 
 Implemented in `src/lib/permissions.ts` (role/ownership) plus the tenant filters in `src/lib/services/*.ts`.
@@ -201,7 +203,7 @@ Admins can't demote or deactivate themselves (400). This stops a company from lo
 | Resource doesn't exist **or belongs to another company**   | 404    |
 | Validation failure, unknown fields in body                 | 400    |
 | Wrong Content-Type on a body                               | 415    |
-| Login locked out                                           | 429    |
+| Login locked out, or an admin mutation rate limit exceeded | 429    |
 
 Ordering detail: role-gated endpoints (project and user management) check the role **before** looking up the target. A member gets 403 for any id, whether it exists or not, in any company, so a 403 reveals nothing about other tenants. An admin targeting another company's resource passes the role check and then gets 404 from the tenant-scoped lookup.
 
@@ -223,6 +225,7 @@ Pages follow the same policy: a member opening `/admin` gets an HTTP 403 page (`
 | 8 | Logging redacts passwords, tokens, cookies, document bodies | `src/lib/redact.ts`, `src/lib/log.ts` |
 | 9 | zod validation on every mutation | `src/lib/validation.ts` + `parseJson` in `src/lib/api.ts` |
 | 10 | Authenticated API responses send `Cache-Control: no-store`; JSON bodies are hard-capped at 64 KB (413), including chunked bodies with no declared length | `src/lib/api.ts` |
+| 11 | Admin mutations (create user, change role, set active) are rate-limited per (company, actor), and write a tenant-scoped audit entry in the same transaction as the mutation | `src/lib/auth/adminThrottle.ts`, `src/lib/services/auditLog.ts`, `src/lib/services/users.ts` |
 
 ### Sessions
 
@@ -252,6 +255,17 @@ Login itself is not CSRF-token protected (there's no session yet). It is protect
 A DB table `login_attempts` keyed by `lower(email) | client-ip`. Five failures within 15 minutes lock that key for 5 minutes (429, password not checked). It is **not** production-grade:
 - the client IP only comes from `X-Forwarded-For` when `TRUST_PROXY_HEADERS=1` (the header is spoofable otherwise). Without it, all clients share one bucket, so the lock is effectively per email, which means an attacker can lock a victim out for 5 minutes;
 - there's no global or per-IP rate limit across many emails (credential stuffing), and no distributed counter.
+
+### Admin audit log and admin-mutation rate limiting
+
+Every call to create a user, change a role, or activate/deactivate a user writes one row to `admin_audit_log`: `company_id`, `actor_user_id`, `target_user_id`, `action`, `old_value`/`new_value` (a role or `"true"`/`"false"`, never a password, token, or document body), and a server-set `created_at`. `company_id` and `actor_user_id` come only from the authenticated session -- there is no field a client can set to forge either.
+
+- **Same transaction, on purpose.** `src/lib/db.ts` adds `withTransaction`, used by `createUser`/`changeRole`/`setUserActive` in `src/lib/services/users.ts`: the mutation and its audit row (and, for deactivation, the session wipe) are one `BEGIN ... COMMIT`. If the insert fails -- the clearest case is a duplicate email, a unique-constraint violation -- the whole transaction rolls back and no audit row is left behind. Runner case 9.4 proves this by counting audit rows before and after a rejected duplicate-email attempt.
+- **`role`/`active` changes capture old and new values.** The target row is read with `SELECT ... FOR UPDATE` inside the same transaction, which also serializes two concurrent changes to the same user. A same-value PUT (set a role to what it already is) is not audited: nothing changed.
+- **Append-only from the application's side.** No route updates or deletes an audit row; the only write path is the one `INSERT` in `recordAdminAudit`.
+- **Read access:** `GET /api/admin/audit-log` (paginated, same keyset scheme as everything else) is admin-only and filtered by `company_id` in SQL, like every other list endpoint -- runner cases 9.7 and 9.8. There is no UI page for it; it exists to be independently verifiable over the API (which is also how the test runner checks it), not as a dashboard feature.
+- **Rate limiting** (`admin_mutation_attempts`, `src/lib/auth/adminThrottle.ts`): up to 10 of those three mutation types per minute, per (company, actor) -- one shared budget across all three, not per endpoint. Checked *after* the permission check (a member never touches an admin's budget) and *before* the transaction, so a throttled request (429) has no mutation and no audit side effect. The atomic-UPSERT shape is the same reasoning as the login-throttle rewrite below: a single statement with `ON CONFLICT` takes a row lock on the counter, so concurrent requests from one actor serialize instead of racing past the limit. Runner case 9.9 fires 15 parallel requests from one fresh admin and asserts **exactly 10 succeed**, not just that *some* request eventually gets a 429.
+- **Known limitation (demo, not production-grade):** one shared budget across create/role/active means a burst of user creation also eats into an admin's role-change headroom for the rest of the window. Splitting the budget per action, or making it configurable per deployment, would be the next step.
 
 ### Logging
 
@@ -310,7 +324,7 @@ This is not production-hardened. "All tests pass" means the specific behaviours 
 | File | Purpose |
 |------|---------|
 | `run.ts` | CLI: target checks, health check, mode detection, runs groups, prints and writes `test-results.json` |
-| `cases.ts` | The 62 cases in 8 groups (below) |
+| `cases.ts` | The 71 cases in 9 groups (below) |
 | `adapter.ts` | **Endpoint adapter**: the typed interface plus `BoundaryHttpAdapter`, written for this app's HTTP API |
 | `fixtures.ts` | Hardcoded identities and IDs (imported from `scripts/seed-data.ts`), DB reset, direct-DB fixture helper |
 | `safe-http.ts` | `fetch` with `redirect: 'manual'`; follows same-origin redirects itself and refuses any cross-origin hop |
@@ -339,7 +353,8 @@ This is not production-hardened. "All tests pass" means the specific behaviours 
 | 5. Deactivation | Member's session works (200) → admin deactivates → **same cookie** gets 401 on `/api/me` and on a document read; re-login → 401. Then 5.7: deactivate directly in the DB with session rows left intact → 401 |
 | 6. Demotion | Second admin lists users (200) → demoted → **same session** gets 403 on admin actions, but `/api/me` is still 200 with role `member` |
 | 7. Positive controls | Same-company read 200, list 200, owner edit 200, member create 201 (owner and company derived from session), admin create user 201, admin override edit 200, admin create/delete project, owner delete 200, Globex reads its own doc 200 |
-| 8. Defense extras | `company_id` / `owner_user_id` in body → 400; missing/wrong CSRF → 403; no/forged session → 401; empty title → 400; 6th failed login → 429 |
+| 8. Defense extras | `company_id` / `owner_user_id` in body → 400; missing/wrong CSRF → 403; no/forged session → 401; empty title → 400; 6th failed login → 429; oversized body (declared-length and chunked) → 413; logout clears cookies even on an expired session but still needs CSRF on a live one; 12 parallel failed logins still lock exactly once (no lost updates, no 500s) |
+| 9. Admin audit log and rate limiting | Successful create/role-change/deactivate each write one audit entry with correct old/new values; a rolled-back mutation (duplicate email) leaves no entry; a forbidden (member) or cross-tenant attempt leaves no entry **and** no mutation; the read endpoint is admin-only and tenant-isolated; 15 parallel mutations from one fresh admin → exactly 10 succeed, the rest 429 |
 
 **Why positive controls matter.** Expected statuses are exact. A server that answers 403/404 to everything would pass groups 1-3 but fail group 7 and every precondition check (2.8, 2.9, 3.8, 3.9, 4.4, 5.1, 6.1, ...). Deny-all shows up as a failing run, not as a way to fake a pass.
 
@@ -375,7 +390,7 @@ It's environment-only: no UI, no API, nothing in `.env.example`. `npm run dev:un
 ```bash
 # 0. Baseline: safe server, everything passes
 npm run dev                       # terminal 1
-npm run test:authz                # terminal 2 → "62/62 passed", exit 0
+npm run test:authz                # terminal 2 → "71/71 passed", exit 0
 
 # 1. BREAK: restart the server in unsafe demo mode
 #    (Ctrl+C in terminal 1)
@@ -397,7 +412,7 @@ npm run test:authz:unsafe         # → banner: "vulnerability DETECTED as desig
 npm run dev
 
 # 4. PASS
-npm run test:authz                # → 62/62 passed, exit 0
+npm run test:authz                # → 71/71 passed, exit 0
 ```
 
 Talking points: the bug is a single missing `AND company_id = $2`, which is the most common real-world multi-tenant bug (broken object-level authorization). Random UUIDs wouldn't have saved it (an id can leak through a URL, a log or a shared link). The positive controls prove the fix isn't "deny everything". Every other control (writes, role checks, listings) kept working because each query enforces tenancy on its own.
@@ -416,6 +431,8 @@ Talking points: the bug is a single missing `AND company_id = $2`, which is the 
 6. Results and server logs are uploaded as an artifact.
 
 A second job, **`e2e`**, runs in parallel with its own Postgres service: it installs Chromium only (`npx playwright install --with-deps chromium`), builds, starts `next start`, and runs the Playwright suite against the production build. Its HTML report, traces of failed tests and the server log are uploaded as an artifact. Tests run serially with no retries: a flaky authorization test is a bug, not noise.
+
+A third job, **`docker-build`**, also runs in parallel with its own Postgres service: it builds the actual image from the `Dockerfile` (`docker build`, not just `next build`), starts the container against that Postgres over `--network host`, waits for `/api/health`, reseeds, and runs the full authorization suite against the **running container**. This is the one job that would catch a break specific to the image itself -- a file the standalone-output copy step missed, a wrong `CMD`, a permission error from the non-root `node` user -- that the `authz` job's plain `next start` can't see. No secret or unsafe-demo value is baked into the image: `DATABASE_URL` is passed to `docker run` the same way a real deployment would inject it, and the unsafe-demo env vars are never passed to the container at all.
 
 Why `next start` for the safe run: it tests what you'd actually deploy (production build, `NODE_ENV=production`, Secure cookies) and doubles as proof that the unsafe toggle is inert there.
 
@@ -463,7 +480,7 @@ Not used: Tailwind or any CSS framework (plain CSS in `src/app/globals.css`, mob
 
 ## What is covered by tests, honestly
 
-- **Authorization runner (62 cases)**: black-box integration tests over HTTP against a real server and a real Postgres. This is the main evidence.
+- **Authorization runner (71 cases)**: black-box integration tests over HTTP against a real server and a real Postgres. This is the main evidence.
 - **UI smoke tests (14 checks)**: fetch server-rendered HTML and string-match: login form renders, anonymous `/dashboard` redirects to `/login`, each of the 4 users sees only their own company and role, member `/admin` is HTTP 403, foreign project/document pages are 404 with no leaked content, the owner sees the editor and a non-owner doesn't, `/results` renders. They don't run JavaScript or click anything.
 - **Unit tests (16, `node:test`)**: the permission functions, the unsafe-mode guard (every combination that must stay off), log redaction, and the runner's target allowlist.
 - **Browser e2e tests (7, Playwright, Chromium, `e2e/`)**: login through the real form (success, and wrong password showing the generic error with no session created), the dashboard showing the right company and role, no admin entry point for a member, a member opening `/admin` directly getting a real HTTP 403 page with no user list behind it, another company's document and project URLs returning 404 with no leaked content, a project page listing only own-company documents, and the CSP: correct header shape plus zero CSP violations while logging in, navigating client-side and opening the document editor. `globalSetup` reseeds the database and refuses non-local targets.
@@ -481,6 +498,7 @@ Partially done: `e2e/` covers the read-side flows above. Next steps would be spe
 - Login CSRF isn't covered by a token (mitigated by the Origin check and JSON-only bodies).
 - Emails are globally unique, so "Email already in use" (409) on user creation reveals that an email exists somewhere in the system.
 - Throttling has the limitations listed above (shared bucket without a trusted proxy, victim lockout possible, no global rate limit).
+- The admin-mutation rate limit is one shared budget across create/role/active per actor, not split per action (see [Admin audit log and admin-mutation rate limiting](#admin-audit-log-and-admin-mutation-rate-limiting)).
 - No session idle-timeout separate from the 8-hour absolute expiry. Expired sessions are only purged when `npm run db:cleanup` is run; nothing schedules it.
 - The CSP allows `'unsafe-eval'` and inline styles under `next dev` only; there's no violation reporting endpoint.
 - Pagination is forward-only with no total count (see [Performance notes](#performance-notes)).
