@@ -52,7 +52,7 @@ export interface AuthzTargetAdapter {
   updateProject(s: Session, id: string, name: string): Promise<ApiResult>;
   deleteProject(s: Session, id: string): Promise<ApiResult>;
 
-  listUsers(s: Session): Promise<ApiResult<Array<{ id: string; email: string }>>>;
+  listUsers(s: Session): Promise<ApiResult<Array<{ id: string; email: string; role: Role; isActive: boolean }>>>;
   createUser(s: Session, email: string, password: string): Promise<ApiResult<{ id: string; role: Role }>>;
   changeRole(s: Session, userId: string, role: Role): Promise<ApiResult>;
   deactivateUser(s: Session, userId: string): Promise<ApiResult>;
@@ -187,7 +187,9 @@ export class BoundaryHttpAdapter implements AuthzTargetAdapter {
   }
 
   async listUsers(s: Session) {
-    return firstPage(await this.raw<Page<{ id: string; email: string }>>(s, 'GET', '/api/admin/users'));
+    return firstPage(
+      await this.raw<Page<{ id: string; email: string; role: Role; isActive: boolean }>>(s, 'GET', '/api/admin/users'),
+    );
   }
 
   createUser(s: Session, email: string, password: string) {

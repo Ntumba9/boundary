@@ -63,6 +63,21 @@ const A = USERS;
 const D = DOCUMENTS;
 const P = PROJECTS;
 
+/** Shape of GET /api/admin/audit-log, used only by group 9 via ctx.api.raw. */
+interface AuditEntry {
+  id: string;
+  actorUserId: string;
+  targetUserId: string;
+  action: 'user_created' | 'role_changed' | 'active_changed';
+  oldValue: string | null;
+  newValue: string | null;
+  createdAt: string;
+}
+interface AuditPage {
+  items: AuditEntry[];
+  nextCursor: string | null;
+}
+
 export const GROUPS: CaseGroup[] = [
   {
     id: '1',
@@ -508,6 +523,169 @@ export const GROUPS: CaseGroup[] = [
           detail: `burst statuses: ${burst.map((r) => r.status).join(',')}`,
         },
         explanation: 'The lock engages atomically at the threshold even under concurrent failures; no 500s.',
+      });
+    },
+  },
+  {
+    id: '9',
+    title: 'Admin audit log and admin-mutation rate limiting',
+    async run(ctx) {
+      const admin = await ctx.login('acme-admin', A.acmeAdmin.email);
+      const member = await ctx.login('acme-member', A.acmeMember.email);
+      const gAdmin = await ctx.login('globex-admin', A.globexAdmin.email);
+
+      const auditLog = (s: Session) => ctx.api.raw<AuditPage>(s, 'GET', '/api/admin/audit-log');
+
+      // --- successful mutations are audited -------------------------------
+      const newEmail = runnerEmail('audit-new', 'acme');
+      const created = await ctx.api.createUser(admin, newEmail, RUNNER_USER_PASSWORD);
+      if (created.status !== 201 || !created.body) throw new Error(`setup: could not create user (status ${created.status})`);
+      const newUserId = created.body.id;
+
+      const afterCreate = await auditLog(admin);
+      const createEntry = afterCreate.body?.items.find((e) => e.targetUserId === newUserId && e.action === 'user_created');
+      ctx.check({
+        id: '9.1',
+        name: 'Successful user creation writes an audit entry',
+        expected: 201,
+        res: created.status,
+        extra: {
+          ok: !!createEntry && createEntry.actorUserId === A.acmeAdmin.id && createEntry.newValue === 'member',
+          detail: `entry: ${JSON.stringify(createEntry ?? null)}`,
+        },
+        explanation: 'The audit row records actor, target and the assigned role, written in the same transaction as the insert.',
+      });
+
+      const roleChange = await ctx.api.changeRole(admin, newUserId, 'admin');
+      const afterRole = await auditLog(admin);
+      const roleEntry = afterRole.body?.items.find((e) => e.targetUserId === newUserId && e.action === 'role_changed');
+      ctx.check({
+        id: '9.2',
+        name: 'Successful role change writes an audit entry with old and new role',
+        expected: 200,
+        res: roleChange.status,
+        extra: {
+          ok: roleEntry?.oldValue === 'member' && roleEntry?.newValue === 'admin',
+          detail: `entry: ${JSON.stringify(roleEntry ?? null)}`,
+        },
+        explanation: 'old_value/new_value capture the transition, read from the row under FOR UPDATE in the same transaction as the write.',
+      });
+
+      const deactivate = await ctx.api.deactivateUser(admin, newUserId);
+      const afterActive = await auditLog(admin);
+      const activeEntry = afterActive.body?.items.find((e) => e.targetUserId === newUserId && e.action === 'active_changed');
+      ctx.check({
+        id: '9.3',
+        name: 'Successful deactivation writes an audit entry with old and new status',
+        expected: 200,
+        res: deactivate.status,
+        extra: {
+          ok: activeEntry?.oldValue === 'true' && activeEntry?.newValue === 'false',
+          detail: `entry: ${JSON.stringify(activeEntry ?? null)}`,
+        },
+        explanation: 'Deactivation, its session wipe and its audit entry commit in one transaction.',
+      });
+
+      // --- rollback: a failed mutation must not leave an audit entry ------
+      const countBeforeDup = (await auditLog(admin)).body?.items.length ?? -1;
+      const dup = await ctx.api.createUser(admin, A.acmeMember.email, RUNNER_USER_PASSWORD);
+      const countAfterDup = (await auditLog(admin)).body?.items.length ?? -1;
+      ctx.check({
+        id: '9.4',
+        name: 'Duplicate-email creation fails and leaves no audit entry (rollback)',
+        expected: 409,
+        res: dup.status,
+        extra: {
+          ok: countBeforeDup >= 0 && countAfterDup === countBeforeDup,
+          detail: `audit entries before=${countBeforeDup} after=${countAfterDup}`,
+        },
+        explanation: 'The insert fails on the unique-email constraint; the whole transaction rolls back, so the audit insert never commits either.',
+      });
+
+      // --- forbidden: a member cannot mutate, and nothing is recorded ----
+      const forbidden = await ctx.api.changeRole(member, A.acmeAdmin.id, 'member');
+      const adminRoleAfter = (await ctx.api.listUsers(admin)).body?.find((u) => u.id === A.acmeAdmin.id)?.role;
+      const forbiddenEntry = (await auditLog(admin)).body?.items.find((e) => e.targetUserId === A.acmeAdmin.id && e.action === 'role_changed');
+      ctx.check({
+        id: '9.5',
+        name: 'Member cannot change a role: no mutation, no audit entry',
+        expected: 403,
+        res: forbidden.status,
+        extra: {
+          ok: adminRoleAfter === 'admin' && !forbiddenEntry,
+          detail: `acmeAdmin role after attempt: ${String(adminRoleAfter)}, matching audit entry: ${JSON.stringify(forbiddenEntry ?? null)}`,
+        },
+        explanation: 'Permission is checked before the throttle or the transaction: a forbidden caller never reaches either.',
+      });
+
+      // --- cross-tenant: 404, no mutation, no audit entry -----------------
+      const crossTenant = await ctx.api.deactivateUser(admin, A.globexMember.id);
+      const globexMemberAfter = (await ctx.api.listUsers(gAdmin)).body?.find((u) => u.id === A.globexMember.id)?.isActive;
+      const crossTenantEntry = (await auditLog(admin)).body?.items.find((e) => e.targetUserId === A.globexMember.id);
+      ctx.check({
+        id: '9.6',
+        name: "Admin cannot deactivate another company's user: 404, no mutation, no audit entry",
+        expected: 404,
+        res: crossTenant.status,
+        extra: {
+          ok: globexMemberAfter === true && !crossTenantEntry,
+          detail: `globex member isActive after attempt: ${String(globexMemberAfter)}, matching audit entry: ${JSON.stringify(crossTenantEntry ?? null)}`,
+        },
+        explanation: 'The UPDATE is scoped by company_id in SQL; it matches zero rows, so there is nothing to audit either.',
+      });
+
+      // --- the read endpoint itself: admin-only and tenant-isolated ------
+      ctx.check({
+        id: '9.7',
+        name: 'Member cannot read the audit log',
+        expected: 403,
+        res: await auditLog(member),
+        explanation: 'Same admin-only rule as every other admin endpoint.',
+      });
+
+      const gNewEmail = runnerEmail('audit-globex', 'globex');
+      const gCreated = await ctx.api.createUser(gAdmin, gNewEmail, RUNNER_USER_PASSWORD);
+      if (gCreated.status !== 201 || !gCreated.body) throw new Error(`setup: could not create Globex user (status ${gCreated.status})`);
+      const acmeView = await auditLog(admin);
+      const leaked = acmeView.body?.items.some((e) => e.actorUserId === A.globexAdmin.id || e.targetUserId === gCreated.body!.id);
+      ctx.check({
+        id: '9.8',
+        name: "Acme admin's audit log contains no Globex entries",
+        expected: 200,
+        res: acmeView,
+        extra: { ok: !leaked, detail: leaked ? 'a Globex actor/target id appeared in the Acme audit log' : 'no cross-tenant rows' },
+        explanation: 'The listing is filtered by company_id in SQL, the same as every other list endpoint.',
+      });
+
+      // --- rate limit: prove the allowed COUNT, not just that one request is 429 ---
+      // A fresh admin, created and promoted here, so its mutation budget is
+      // untouched by everything above (the limit is per actor, not per
+      // endpoint or group). MAX below must match MAX_ADMIN_MUTATIONS in
+      // src/lib/auth/adminThrottle.ts.
+      const MAX = 10;
+      const burstEmail = runnerEmail('burst-admin', 'acme');
+      const burstCreated = await ctx.api.createUser(admin, burstEmail, RUNNER_USER_PASSWORD);
+      if (burstCreated.status !== 201 || !burstCreated.body) throw new Error(`setup: could not create burst admin (status ${burstCreated.status})`);
+      const burstPromote = await ctx.api.changeRole(admin, burstCreated.body.id, 'admin');
+      if (burstPromote.status !== 200) throw new Error(`setup: could not promote burst admin (status ${burstPromote.status})`);
+      const burstAdmin = await ctx.login('acme-burst-admin', burstEmail, RUNNER_USER_PASSWORD);
+
+      const attempts = MAX + 5;
+      const burst = await Promise.all(
+        Array.from({ length: attempts }, () => ctx.api.createUser(burstAdmin, runnerEmail('burst', 'acme'), RUNNER_USER_PASSWORD)),
+      );
+      const succeeded = burst.filter((r) => r.status === 201).length;
+      const throttled = burst.filter((r) => r.status === 429).length;
+      ctx.check({
+        id: '9.9',
+        name: `${attempts} parallel admin mutations from one fresh admin: exactly ${MAX} succeed`,
+        expected: MAX,
+        res: succeeded,
+        extra: {
+          ok: succeeded === MAX && throttled === attempts - MAX && succeeded + throttled === attempts,
+          detail: `succeeded=${succeeded} throttled=${throttled} other=${attempts - succeeded - throttled}`,
+        },
+        explanation: 'The atomic per-(company,actor) counter admits exactly the limit, under concurrency, and rejects the rest with 429 -- not "one request got 429", the exact allowed count.',
       });
     },
   },
