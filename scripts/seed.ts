@@ -16,7 +16,13 @@ export async function seed(connectionString: string = requireLocalDatabaseUrl())
     const passwordHash = await hash(DEMO_PASSWORD);
 
     await client.query('BEGIN');
-    await client.query('TRUNCATE login_attempts, sessions, documents, projects, users, companies CASCADE');
+    // admin_audit_log is not listed explicitly: it has no rows of its own
+    // reason to survive a reseed, and TRUNCATE ... CASCADE already includes it
+    // because it has foreign keys into users/companies. admin_mutation_attempts
+    // has no such FK (same reason login_attempts is listed), so it must be named.
+    await client.query(
+      'TRUNCATE login_attempts, admin_mutation_attempts, sessions, documents, projects, users, companies CASCADE',
+    );
 
     for (const c of Object.values(COMPANIES)) {
       await client.query('INSERT INTO companies (id, name) VALUES ($1, $2)', [c.id, c.name]);

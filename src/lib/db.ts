@@ -1,5 +1,5 @@
 import 'server-only';
-import { Pool, type QueryResultRow } from 'pg';
+import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import { log } from './log';
 
 // One pool per server process. In `next dev`, modules are re-evaluated on hot
@@ -47,4 +47,38 @@ export async function query<T extends QueryResultRow>(
 ): Promise<{ rows: T[]; rowCount: number }> {
   const result = await getPool().query<T>(text, params as unknown[]);
   return { rows: result.rows, rowCount: result.rowCount ?? 0 };
+}
+
+/** The subset of `query` available inside a transaction: same shape, bound to one client. */
+export interface TxQuery {
+  query<T extends QueryResultRow>(text: string, params?: readonly unknown[]): Promise<{ rows: T[]; rowCount: number }>;
+}
+
+/**
+ * Run `fn` inside BEGIN/COMMIT, on a single client checked out for the whole
+ * transaction. Any thrown error (including an HttpError from a business-logic
+ * check made mid-transaction, e.g. "target not found") rolls the transaction
+ * back, so a mutation and its audit record either both land or neither does.
+ */
+export async function withTransaction<T>(fn: (tx: TxQuery) => Promise<T>): Promise<T> {
+  const client: PoolClient = await getPool().connect();
+  const tx: TxQuery = {
+    query: async (text, params = []) => {
+      const result = await client.query(text, params as unknown[]);
+      return { rows: result.rows, rowCount: result.rowCount ?? 0 };
+    },
+  };
+  try {
+    await client.query('BEGIN');
+    const result = await fn(tx);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK').catch((rollbackErr: unknown) => {
+      log.error('transaction_rollback_failed', { message: (rollbackErr as Error).message });
+    });
+    throw err;
+  } finally {
+    client.release();
+  }
 }

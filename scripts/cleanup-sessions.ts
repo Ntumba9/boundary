@@ -1,4 +1,4 @@
-// Deletes expired session rows and stale login-throttle rows.
+// Deletes expired session rows and stale login/admin-mutation throttle rows.
 // Usage: npm run db:cleanup   (run it periodically, e.g. from cron or a scheduled CI job)
 //
 // Not a background worker on purpose: expired sessions are already rejected by
@@ -9,8 +9,9 @@
 import pg from 'pg';
 import { requireDatabaseUrl } from './db-url.ts';
 
-// Must stay >= WINDOW_MINUTES in src/lib/auth/throttle.ts (15), or a row could
-// be deleted while it still counts toward a lockout.
+// Must stay >= WINDOW_MINUTES in src/lib/auth/throttle.ts (15) and >=
+// ADMIN_WINDOW_MINUTES in src/lib/auth/adminThrottle.ts (1), or a row could be
+// deleted while it still counts toward a lockout or a rate limit.
 const THROTTLE_RETENTION_MINUTES = 60;
 
 async function main(): Promise<void> {
@@ -26,8 +27,15 @@ async function main(): Promise<void> {
           AND (locked_until IS NULL OR locked_until < now())`,
       [THROTTLE_RETENTION_MINUTES],
     );
+    // Same idea, no lock concept: a row is stale once its window is well past
+    // and could not possibly still be the caller's current counting window.
+    const adminAttempts = await client.query(
+      `DELETE FROM admin_mutation_attempts WHERE window_start < now() - make_interval(mins => $1)`,
+      [THROTTLE_RETENTION_MINUTES],
+    );
     console.log(
-      `deleted ${sessions.rowCount ?? 0} expired sessions, ${attempts.rowCount ?? 0} stale login_attempts rows`,
+      `deleted ${sessions.rowCount ?? 0} expired sessions, ${attempts.rowCount ?? 0} stale login_attempts rows, ` +
+        `${adminAttempts.rowCount ?? 0} stale admin_mutation_attempts rows`,
     );
   } finally {
     await client.end();

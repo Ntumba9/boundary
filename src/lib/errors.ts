@@ -4,7 +4,7 @@
 //   403  same company, but forbidden by role / ownership / CSRF
 //   404  not found OR belongs to another company (never reveal existence)
 //   400  validation failure
-//   429  login throttled
+//   429  login throttled, or an admin mutation rate limit exceeded
 
 export class HttpError extends Error {
   readonly status: number;
@@ -21,6 +21,7 @@ export const unauthorized = (msg = 'Authentication required') => new HttpError(4
 export const forbidden = (msg = 'Forbidden') => new HttpError(403, msg);
 export const notFound = (msg = 'Not found') => new HttpError(404, msg);
 export const badRequest = (msg = 'Invalid request', details?: unknown) => new HttpError(400, msg, details);
+export const tooManyRequests = (msg = 'Too many requests. Try again shortly.') => new HttpError(429, msg);
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
