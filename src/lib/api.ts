@@ -5,6 +5,10 @@ import { verifyCsrf, verifyOrigin } from './auth/csrf';
 import { resolveSession, SESSION_COOKIE, type AuthContext } from './auth/session';
 import { HttpError } from './errors';
 import { log } from './log';
+import { runWithRequestId } from './requestContext';
+import { resolveRequestId } from './requestId';
+
+const REQUEST_ID_HEADER = 'X-Request-ID';
 
 /**
  * Wrapper for every authenticated route handler.
@@ -19,34 +23,46 @@ export function authed<P extends Record<string, string> = Record<string, never>>
   handler: (args: { req: NextRequest; auth: AuthContext; params: P }) => Promise<Response>,
 ) {
   return async (req: NextRequest, ctx: { params: Promise<P> }): Promise<Response> => {
-    try {
-      const auth = await resolveSession(req.cookies.get(SESSION_COOKIE)?.value);
-      if (isMutation(req.method)) {
-        verifyOrigin(req);
-        verifyCsrf(req, auth);
+    const requestId = resolveRequestId(req.headers.get('x-request-id'));
+    return runWithRequestId(requestId, async () => {
+      try {
+        const auth = await resolveSession(req.cookies.get(SESSION_COOKIE)?.value);
+        if (isMutation(req.method)) {
+          verifyOrigin(req);
+          verifyCsrf(req, auth);
+        }
+        const params = ctx?.params ? await ctx.params : ({} as P);
+        const res = await handler({ req, auth, params });
+        // Authenticated JSON is per-user; no cache, shared or browser, may store it.
+        res.headers.set('Cache-Control', 'no-store');
+        res.headers.set(REQUEST_ID_HEADER, requestId);
+        return res;
+      } catch (err) {
+        const res = errorResponse(err, req, requestId);
+        res.headers.set('Cache-Control', 'no-store');
+        res.headers.set(REQUEST_ID_HEADER, requestId);
+        return res;
       }
-      const params = ctx?.params ? await ctx.params : ({} as P);
-      const res = await handler({ req, auth, params });
-      // Authenticated JSON is per-user; no cache, shared or browser, may store it.
-      res.headers.set('Cache-Control', 'no-store');
-      return res;
-    } catch (err) {
-      const res = errorResponse(err, req);
-      res.headers.set('Cache-Control', 'no-store');
-      return res;
-    }
+    });
   };
 }
 
 /** Wrapper for unauthenticated handlers (login, health) so errors are handled uniformly. */
 export function publicRoute(handler: (req: NextRequest) => Promise<Response>) {
   return async (req: NextRequest): Promise<Response> => {
-    try {
-      if (isMutation(req.method)) verifyOrigin(req);
-      return await handler(req);
-    } catch (err) {
-      return errorResponse(err, req);
-    }
+    const requestId = resolveRequestId(req.headers.get('x-request-id'));
+    return runWithRequestId(requestId, async () => {
+      try {
+        if (isMutation(req.method)) verifyOrigin(req);
+        const res = await handler(req);
+        res.headers.set(REQUEST_ID_HEADER, requestId);
+        return res;
+      } catch (err) {
+        const res = errorResponse(err, req, requestId);
+        res.headers.set(REQUEST_ID_HEADER, requestId);
+        return res;
+      }
+    });
   };
 }
 
@@ -114,11 +130,14 @@ export function json(data: unknown, status = 200): NextResponse {
   return NextResponse.json(data, { status });
 }
 
-function errorResponse(err: unknown, req: NextRequest): Response {
+// Every error body carries the same request id as the X-Request-ID header, so
+// a user-reported failure can be found in the server logs by that id alone --
+// never a stack trace or any other internal detail.
+function errorResponse(err: unknown, req: NextRequest, requestId: string): Response {
   if (err instanceof HttpError) {
     if (err.status >= 500) log.error('request_failed', { path: req.nextUrl.pathname, status: err.status });
     return NextResponse.json(
-      { error: err.message, ...(err.details ? { details: err.details } : {}) },
+      { error: err.message, requestId, ...(err.details ? { details: err.details } : {}) },
       { status: err.status },
     );
   }
@@ -126,11 +145,12 @@ function errorResponse(err: unknown, req: NextRequest): Response {
     return NextResponse.json(
       {
         error: 'Validation failed',
+        requestId,
         issues: err.issues.map((i) => ({ path: i.path.join('.'), message: i.message })),
       },
       { status: 400 },
     );
   }
   log.error('unhandled_error', { path: req.nextUrl.pathname, method: req.method, err });
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  return NextResponse.json({ error: 'Internal server error', requestId }, { status: 500 });
 }
