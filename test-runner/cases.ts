@@ -447,6 +447,68 @@ export const GROUPS: CaseGroup[] = [
         extra: { ok: statuses.every((s) => s === 401), detail: `first five were ${statuses.join(',')}` },
         explanation: 'Basic per-email+IP lockout after repeated failures.',
       });
+
+      ctx.check({
+        id: '8.9',
+        name: 'JSON body above the 64 KB declared-size cap',
+        expected: 413,
+        res: await ctx.api.raw(member, 'POST', `/api/projects/${P.acmeAnvil.id}/documents`, {
+          body: { title: 't', body: 'x'.repeat(70 * 1024) },
+        }),
+        explanation: 'Oversized bodies are rejected before they are buffered and parsed.',
+      });
+      ctx.check({
+        id: '8.10',
+        name: 'Logout with an already-expired session',
+        expected: 200,
+        res: await ctx.api.raw(
+          {
+            label: 'stale-session',
+            cookies: new Map([
+              ['boundary_session', 'e'.repeat(64)],
+              ['boundary_csrf', '0'.repeat(64)],
+            ]),
+            csrfToken: '0'.repeat(64),
+          },
+          'POST',
+          '/api/auth/logout',
+        ),
+        explanation: 'Logout must still succeed (and clear the cookies) when the session is already gone server-side.',
+      });
+      ctx.check({
+        id: '8.11',
+        name: 'Logout without the CSRF header (live session)',
+        expected: 403,
+        res: await ctx.api.raw(member, 'POST', '/api/auth/logout', { csrf: 'omit' }),
+        explanation: 'A valid session still needs the double-submit token to log out.',
+      });
+      ctx.check({
+        id: '8.12',
+        name: 'Chunked body (no Content-Length) above the 64 KB cap',
+        expected: 413,
+        res: await ctx.api.raw(member, 'POST', `/api/projects/${P.acmeAnvil.id}/documents`, {
+          body: { title: 't', body: 'x'.repeat(70 * 1024) },
+          chunked: true,
+        }),
+        explanation: 'The body cap bounds the stream itself; a missing or forged Content-Length cannot bypass it.',
+      });
+
+      const burstKey = runnerEmail('throttle-parallel', 'acme');
+      const burst = await Promise.all(
+        Array.from({ length: 12 }, () => ctx.api.login('throttle-parallel', burstKey, 'wrong-password')),
+      );
+      const afterBurst = await ctx.api.login('throttle-parallel', burstKey, 'wrong-password');
+      ctx.check({
+        id: '8.13',
+        name: 'Twelve parallel failed logins still trigger the lockout',
+        expected: 429,
+        res: afterBurst.status,
+        extra: {
+          ok: burst.every((r) => r.status === 401 || r.status === 429),
+          detail: `burst statuses: ${burst.map((r) => r.status).join(',')}`,
+        },
+        explanation: 'The lock engages atomically at the threshold even under concurrent failures; no 500s.',
+      });
     },
   },
 ];

@@ -11,7 +11,8 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 export interface SafeFetchOptions {
   method?: string;
   headers?: Record<string, string>;
-  body?: string;
+  /** A string body is sent with a Content-Length; a stream body goes chunked (no declared length). */
+  body?: string | ReadableStream<Uint8Array>;
   /** Return 3xx responses instead of following them (used by UI smoke tests). */
   noFollow?: boolean;
 }
@@ -25,13 +26,17 @@ export async function safeFetch(targetOrigin: string, url: string, opts: SafeFet
     if (current.origin !== targetOrigin) {
       throw new CrossOriginRedirectError(`Refusing request to ${current.origin}; target is ${targetOrigin}`);
     }
-    const res = await fetch(current, {
+    // A stream body requires duplex:'half' (undici sends it chunked, with no
+    // Content-Length) - that is exactly the transport shape being tested.
+    const init = {
       method,
       headers: opts.headers,
       body,
       redirect: 'manual',
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+      ...(body instanceof ReadableStream ? { duplex: 'half' } : {}),
+    } as RequestInit;
+    const res = await fetch(current, init);
     if (!REDIRECT_STATUSES.has(res.status) || opts.noFollow) return res;
 
     const location = res.headers.get('location');

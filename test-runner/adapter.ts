@@ -61,6 +61,8 @@ export interface AuthzTargetAdapter {
 /** Options for raw requests used by the app-specific "defense extras" cases (CSRF, mass assignment). */
 export interface RawOptions {
   body?: unknown;
+  /** Send the JSON body chunked (streamed, no Content-Length) instead of with a declared length. */
+  chunked?: boolean;
   /** 'session' = correct token (default), 'omit' = no header, or a literal wrong value. */
   csrf?: 'session' | 'omit' | { value: string };
   /** Replace the session cookie value (forged-token test). */
@@ -91,11 +93,24 @@ export class BoundaryHttpAdapter implements AuthzTargetAdapter {
         else if (csrf !== 'omit') headers['x-csrf-token'] = csrf.value;
       }
     }
-    const res = await safeFetch(this.origin, this.origin + path, {
-      method,
-      headers,
-      body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
-    });
+    let reqBody: string | ReadableStream<Uint8Array> | undefined;
+    if (opts.body !== undefined) {
+      const text = JSON.stringify(opts.body);
+      if (opts.chunked) {
+        const bytes = new TextEncoder().encode(text);
+        // Two chunks, so the request really exercises a streamed body.
+        reqBody = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes.subarray(0, 64));
+            controller.enqueue(bytes.subarray(64));
+            controller.close();
+          },
+        });
+      } else {
+        reqBody = text;
+      }
+    }
+    const res = await safeFetch(this.origin, this.origin + path, { method, headers, body: reqBody });
     let body: unknown = null;
     const text = await res.text();
     if (text) {
