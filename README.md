@@ -77,19 +77,23 @@ If your app is not on port 3000, pass `--base-url http://localhost:PORT` (after 
 
 Dashboard for an Acme admin - projects are scoped to the signed-in tenant:
 
-![Dashboard: Acme Corp projects](docs/screenshots/dashboard.png)
+![Dashboard: Acme Corp projects](docs/screenshots/1-dashboard.png)
 
 A project page - document ownership and edit affordances come from the server:
 
-![Project page with tenant-scoped documents](docs/screenshots/project.png)
+![Project page with tenant-scoped documents](docs/screenshots/2-project.png)
+
+A document page - ownership controls what each member can edit:
+
+![Document page](docs/screenshots/3-document.png)
 
 The admin panel - user and project management, enforced server-side per tenant:
 
-![Admin panel](docs/screenshots/admin.png)
+![Admin panel](docs/screenshots/4-admin.png)
 
 The [test runner](#test-runner) renders its latest output at `/results` - 62 authorization cases passing in safe mode:
 
-![Authorization test runner output](docs/screenshots/test-results.png)
+![Authorization test runner output](docs/screenshots/5-test-results.png)
 
 ---
 
