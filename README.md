@@ -58,7 +58,7 @@ Seed data: Acme has 3 projects / 7 documents, Globex has 2 projects / 5 document
 ### Run the tests against the running dev server
 
 ```bash
-npm run test:authz            # authorization runner, safe mode: expect 57/57 PASS, exit 0
+npm run test:authz            # authorization runner, safe mode: expect 62/62 PASS, exit 0
 npm run test:smoke            # UI smoke tests (server-rendered HTML checks)
 npm run test:e2e              # Playwright browser tests (one-time: npx playwright install chromium)
 npm run test:unit             # pure unit tests, no server needed
@@ -222,12 +222,13 @@ Pages follow the same policy: a member opening `/admin` gets an HTTP 403 page (`
 | 7 | Login throttling | `src/lib/auth/throttle.ts` |
 | 8 | Logging redacts passwords, tokens, cookies, document bodies | `src/lib/redact.ts`, `src/lib/log.ts` |
 | 9 | zod validation on every mutation | `src/lib/validation.ts` + `parseJson` in `src/lib/api.ts` |
+| 10 | Authenticated API responses send `Cache-Control: no-store`; JSON bodies are hard-capped at 64 KB (413), including chunked bodies with no declared length | `src/lib/api.ts` |
 
 ### Sessions
 
 - Token: `crypto.randomBytes(32).toString('hex')`, opaque. The DB stores only `sha256(token)` and an expiry (8 hours). A database leak does not yield usable cookies.
 - Cookie `boundary_session`: `HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` when `NODE_ENV=production` (override with `COOKIE_SECURE=0|1`).
-- Logout deletes the session row. Deactivation deletes all of that user's session rows.
+- Logout deletes the session row and always clears the cookies, even if the session already expired or the account was deactivated (the CSRF check still applies to a live session). Deactivation deletes all of that user's session rows.
 - **Deactivation is enforced twice, on purpose:** (a) `resolveSession` rejects `is_active = false` on every request, and (b) sessions are deleted so reactivating a user does not bring old, possibly stolen, tokens back to life. Runner case 5.7 tests (a) alone by flipping `is_active` directly in the DB without touching sessions.
 
 ### Passwords
@@ -309,7 +310,7 @@ This is not production-hardened. "All tests pass" means the specific behaviours 
 | File | Purpose |
 |------|---------|
 | `run.ts` | CLI: target checks, health check, mode detection, runs groups, prints and writes `test-results.json` |
-| `cases.ts` | The 57 cases in 8 groups (below) |
+| `cases.ts` | The 62 cases in 8 groups (below) |
 | `adapter.ts` | **Endpoint adapter**: the typed interface plus `BoundaryHttpAdapter`, written for this app's HTTP API |
 | `fixtures.ts` | Hardcoded identities and IDs (imported from `scripts/seed-data.ts`), DB reset, direct-DB fixture helper |
 | `safe-http.ts` | `fetch` with `redirect: 'manual'`; follows same-origin redirects itself and refuses any cross-origin hop |
@@ -374,7 +375,7 @@ It's environment-only: no UI, no API, nothing in `.env.example`. `npm run dev:un
 ```bash
 # 0. Baseline: safe server, everything passes
 npm run dev                       # terminal 1
-npm run test:authz                # terminal 2 → "57/57 passed", exit 0
+npm run test:authz                # terminal 2 → "62/62 passed", exit 0
 
 # 1. BREAK: restart the server in unsafe demo mode
 #    (Ctrl+C in terminal 1)
@@ -396,7 +397,7 @@ npm run test:authz:unsafe         # → banner: "vulnerability DETECTED as desig
 npm run dev
 
 # 4. PASS
-npm run test:authz                # → 57/57 passed, exit 0
+npm run test:authz                # → 62/62 passed, exit 0
 ```
 
 Talking points: the bug is a single missing `AND company_id = $2`, which is the most common real-world multi-tenant bug (broken object-level authorization). Random UUIDs wouldn't have saved it (an id can leak through a URL, a log or a shared link). The positive controls prove the fix isn't "deny everything". Every other control (writes, role checks, listings) kept working because each query enforces tenancy on its own.
@@ -462,7 +463,7 @@ Not used: Tailwind or any CSS framework (plain CSS in `src/app/globals.css`, mob
 
 ## What is covered by tests, honestly
 
-- **Authorization runner (57 cases)**: black-box integration tests over HTTP against a real server and a real Postgres. This is the main evidence.
+- **Authorization runner (62 cases)**: black-box integration tests over HTTP against a real server and a real Postgres. This is the main evidence.
 - **UI smoke tests (14 checks)**: fetch server-rendered HTML and string-match: login form renders, anonymous `/dashboard` redirects to `/login`, each of the 4 users sees only their own company and role, member `/admin` is HTTP 403, foreign project/document pages are 404 with no leaked content, the owner sees the editor and a non-owner doesn't, `/results` renders. They don't run JavaScript or click anything.
 - **Unit tests (16, `node:test`)**: the permission functions, the unsafe-mode guard (every combination that must stay off), log redaction, and the runner's target allowlist.
 - **Browser e2e tests (7, Playwright, Chromium, `e2e/`)**: login through the real form (success, and wrong password showing the generic error with no session created), the dashboard showing the right company and role, no admin entry point for a member, a member opening `/admin` directly getting a real HTTP 403 page with no user list behind it, another company's document and project URLs returning 404 with no leaked content, a project page listing only own-company documents, and the CSP: correct header shape plus zero CSP violations while logging in, navigating client-side and opening the document editor. `globalSetup` reseeds the database and refuses non-local targets.
