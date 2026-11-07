@@ -1,0 +1,184 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  authz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: boundary
+          POSTGRES_PASSWORD: boundary_dev_only
+          POSTGRES_DB: boundary
+        ports:
+          - 5440:5432
+        options: >-
+          --health-cmd "pg_isready -U boundary -d boundary"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      DATABASE_URL: postgres://boundary:boundary_dev_only@localhost:5440/boundary
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint and typecheck
+        run: |
+          npm run lint
+          npm run typecheck
+
+      - name: Unit tests (permission matrix, unsafe-mode guard, redaction, runner allowlist)
+        run: npm run test:unit
+
+      - name: Migrate and seed
+        run: |
+          npm run db:migrate
+          npm run db:seed
+
+      - name: Build
+        run: npm run build
+
+      # ---------------------------------------------------------------------
+      # SAFE MODE against the production build (`next start`).
+      # The unsafe env vars are deliberately SET here: NODE_ENV=production must
+      # refuse them, and the health check asserts unsafeDemoMode=false.
+      # ---------------------------------------------------------------------
+      - name: Start production server (unsafe vars set, must be refused)
+        run: |
+          BOUNDARY_UNSAFE_DEMO_MODE=1 BOUNDARY_ALLOW_UNSAFE=local-demo-only \
+            nohup npx next start -p 3000 > prod-server.log 2>&1 &
+          node scripts/wait-for-health.ts http://localhost:3000 --expect-unsafe=false --timeout=90
+
+      - name: Authorization test runner (safe mode, must exit 0)
+        run: npm run test:authz -- --base-url http://localhost:3000
+
+      - name: UI smoke tests
+        run: npm run test:smoke -- --base-url http://localhost:3000
+
+      - name: Keep safe-mode results
+        if: always()
+        run: cp test-results.json test-results-safe.json || true
+
+      # ---------------------------------------------------------------------
+      # UNSAFE DEMO MODE against `next dev` (the toggle refuses to run under
+      # NODE_ENV=production, so dev mode is required by design). Different
+      # port, so a leftover production process can't answer these requests.
+      # ---------------------------------------------------------------------
+      - name: Start dev server in unsafe demo mode
+        run: |
+          nohup npm run dev:unsafe -- -p 3001 > unsafe-server.log 2>&1 &
+          # Health must be up AND report unsafe mode; a crash fails here, never later.
+          node scripts/wait-for-health.ts http://localhost:3001 --expect-unsafe=true --timeout=120
+
+      - name: Authorization test runner (unsafe mode, expect exactly one intentional failure)
+        run: |
+          rm -f test-results.json
+          set +e
+          npm run test:authz:unsafe -- --base-url http://localhost:3001
+          code=$?
+          set -e
+          # 1 = case failures (expected here). 0 would mean the vulnerability went
+          # undetected; 2 would mean a config/startup error. Both fail the job.
+          if [ "$code" -ne 1 ]; then
+            echo "Expected runner exit code 1 in unsafe mode, got $code"
+            exit 1
+          fi
+          npm run test:assert-unsafe
+
+      - name: Upload results and server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boundary-test-results
+          path: |
+            test-results-safe.json
+            test-results.json
+            prod-server.log
+            unsafe-server.log
+          if-no-files-found: ignore
+
+  # Browser tests (Playwright, Chromium only) against the production build.
+  # Separate job so it runs in parallel with `authz` instead of adding to its
+  # wall time; it needs its own database because both jobs reseed.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: boundary
+          POSTGRES_PASSWORD: boundary_dev_only
+          POSTGRES_DB: boundary
+        ports:
+          - 5440:5432
+        options: >-
+          --health-cmd "pg_isready -U boundary -d boundary"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      DATABASE_URL: postgres://boundary:boundary_dev_only@localhost:5440/boundary
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Migrate and build
+        run: |
+          npm run db:migrate
+          npm run build
+
+      - name: Start production server
+        run: |
+          nohup npx next start -p 3000 > e2e-server.log 2>&1 &
+          node scripts/wait-for-health.ts http://localhost:3000 --expect-unsafe=false --timeout=90
+
+      - name: Playwright e2e (seeds the database in globalSetup)
+        run: npm run test:e2e
+        env:
+          BOUNDARY_BASE_URL: http://localhost:3000
+
+      - name: Upload Playwright report and server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boundary-e2e
+          path: |
+            playwright-report/
+            test-results/
+            e2e-server.log
+          if-no-files-found: ignore
