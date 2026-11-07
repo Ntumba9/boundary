@@ -1,0 +1,50 @@
+{
+  "name": "boundary",
+  "version": "0.1.0",
+  "description": "Multi-tenant document app demonstrating tenant isolation and role-based access control, with an HTTP authorization test runner and a switchable vulnerability demo.",
+  "author": "Ntumba Kalongo",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "dev:unsafe": "node scripts/dev-unsafe.ts",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down",
+    "db:migrate": "node --env-file-if-exists=.env scripts/migrate.ts",
+    "db:seed": "node --env-file-if-exists=.env scripts/seed.ts",
+    "db:cleanup": "node --env-file-if-exists=.env scripts/cleanup-sessions.ts",
+    "test:unit": "node --test \"test/unit/*.test.ts\"",
+    "test:authz": "node --env-file-if-exists=.env test-runner/run.ts",
+    "test:authz:unsafe": "node --env-file-if-exists=.env test-runner/run.ts --unsafe-demo",
+    "test:smoke": "node --env-file-if-exists=.env test-runner/smoke.ts",
+    "test:assert-unsafe": "node test-runner/assert-unsafe-results.ts",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@node-rs/argon2": "^2.2.2",
+    "next": "16.4.5",
+    "pg": "^8.23.1",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "server-only": "^0.0.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.0",
+    "@types/node": "^22",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.4.5",
+    "typescript": "^5"
+  }
+}

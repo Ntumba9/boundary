@@ -1,0 +1,21 @@
+{
+  // Type-checks the Node CLI code (scripts/, test-runner/, test/) and the
+  // Playwright suite (e2e/). The CLI files are executed directly by Node's
+  // built-in TypeScript type stripping (Node >= 22.18), so they must use only
+  // erasable syntax and explicit .ts import extensions; e2e/ follows the same
+  // rules so it can import scripts/seed-data.ts the same way.
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["scripts/**/*.ts", "test-runner/**/*.ts", "test/**/*.ts", "e2e/**/*.ts", "playwright.config.ts"]
+}
