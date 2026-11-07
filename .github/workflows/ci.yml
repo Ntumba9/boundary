@@ -182,3 +182,76 @@ jobs:
             test-results/
             e2e-server.log
           if-no-files-found: ignore
+
+  # Builds the actual image from the Dockerfile (not just `next build`) and
+  # boots it, so a break in the image -- a file the standalone copy step
+  # misses, a wrong CMD, a permission error from running as the non-root
+  # `node` user -- fails CI even though the plain `next build`/`next start`
+  # path in the `authz` job above is unaffected. No secret or unsafe-demo
+  # value is ever baked into the image: DATABASE_URL is injected at `docker
+  # run`, exactly as a real deployment would, and the unsafe-demo vars are
+  # never passed to the container at all.
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: boundary
+          POSTGRES_PASSWORD: boundary_dev_only
+          POSTGRES_DB: boundary
+        ports:
+          - 5440:5432
+        options: >-
+          --health-cmd "pg_isready -U boundary -d boundary"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      DATABASE_URL: postgres://boundary:boundary_dev_only@localhost:5440/boundary
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the shipped image
+        run: docker build -t boundary-app:ci .
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # Only used to run the host-side seed/test-runner commands below, not
+      # to build the image: the image build has no dependency on this step.
+      - name: Install dependencies
+        run: npm ci
+
+      # --network host: the container reaches the postgres service on
+      # localhost:5440, the same DATABASE_URL a host process would use. The
+      # container runs its own migration (see Dockerfile CMD) before serving.
+      - name: Run the image
+        run: |
+          docker run -d --name boundary-app --network host \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -e PORT=3000 \
+            boundary-app:ci
+
+      - name: Wait for health (fails fast on a crash, not a timeout)
+        run: node scripts/wait-for-health.ts http://localhost:3000 --expect-unsafe=false --timeout=90
+
+      - name: Seed and run the full authorization suite against the containerized image
+        run: |
+          npm run db:seed
+          npm run test:authz -- --base-url http://localhost:3000
+
+      - name: Container logs
+        if: always()
+        run: docker logs boundary-app || true
+
+      - name: Stop container
+        if: always()
+        run: docker stop boundary-app || true
