@@ -9,6 +9,7 @@ A small multi-tenant document app built to show **tenant isolation and role-base
 ## Contents
 
 - [Quick start](#quick-start)
+- [Screenshots](#screenshots)
 - [Running in Docker](#running-in-docker)
 - [Architecture](#architecture)
 - [Performance notes](#performance-notes)
@@ -69,6 +70,30 @@ Then open http://localhost:3000/results to see the latest runner output as a tab
 If your app is not on port 3000, pass `--base-url http://localhost:PORT` (after `--` when using npm), or set `BOUNDARY_BASE_URL`.
 
 > The runner, smoke tests and e2e tests **reset the local database** (reseed). Any edits you made in the UI are wiped, and existing sessions are invalidated, so you will need to log in again.
+
+---
+
+## Screenshots
+
+Dashboard for an Acme admin - projects are scoped to the signed-in tenant:
+
+![Dashboard: Acme Corp projects](docs/screenshots/1-dashboard.png)
+
+A project page - document ownership and edit affordances come from the server:
+
+![Project page with tenant-scoped documents](docs/screenshots/2-project.png)
+
+A document page - ownership controls what each member can edit:
+
+![Document page](docs/screenshots/3-document.png)
+
+The admin panel - user and project management, enforced server-side per tenant:
+
+![Admin panel](docs/screenshots/4-admin.png)
+
+The [test runner](#test-runner) renders its latest output at `/results` - 62 authorization cases passing in safe mode:
+
+![Authorization test runner output](docs/screenshots/5-test-results.png)
 
 ---
 
