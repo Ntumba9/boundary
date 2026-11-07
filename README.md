@@ -91,7 +91,7 @@ The admin panel - user and project management, enforced server-side per tenant:
 
 ![Admin panel](docs/screenshots/4-admin.png)
 
-The [test runner](#test-runner) renders its latest output at `/results` - 62 authorization cases passing in safe mode:
+The [test runner](#test-runner) renders its latest output at `/results` (screenshot predates the audit-log test group added since; see [Cases](#cases) for the current count):
 
 ![Authorization test runner output](docs/screenshots/5-test-results.png)
 
