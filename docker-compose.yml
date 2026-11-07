@@ -1,0 +1,49 @@
+name: boundary
+
+# Local development only. Credentials here are throwaway demo values.
+#
+#   docker compose up -d --wait                     db only (npm run db:up; the default)
+#   docker compose --profile app up -d --build --wait   db + the app in a container
+#
+# The database host port defaults to 5440 (not 5432) so it does not collide
+# with a locally installed Postgres. Override with BOUNDARY_DB_PORT if needed.
+# The app's host port defaults to 3000; override with BOUNDARY_APP_PORT.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: boundary
+      POSTGRES_PASSWORD: boundary_dev_only
+      POSTGRES_DB: boundary
+    ports:
+      - "127.0.0.1:${BOUNDARY_DB_PORT:-5440}:5432"
+    volumes:
+      - boundary_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U boundary -d boundary"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Production build of the app (see Dockerfile). Opt-in via the "app" profile
+  # so `npm run db:up` keeps starting only the database. The container applies
+  # migrations on start; seeding stays a host-side step (npm run db:seed),
+  # because the seed script refuses to wipe any database that isn't on localhost.
+  app:
+    profiles: ["app"]
+    build: .
+    init: true
+    environment:
+      DATABASE_URL: postgres://boundary:boundary_dev_only@db:5432/boundary
+      # Plain http on localhost: browsers accept Secure cookies there, so the
+      # production default (Secure on) is kept. Set COOKIE_SECURE=0 only if you
+      # reach the container through a non-localhost http hostname.
+    ports:
+      - "127.0.0.1:${BOUNDARY_APP_PORT:-3000}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    stop_grace_period: 15s
+
+volumes:
+  boundary_pgdata:
