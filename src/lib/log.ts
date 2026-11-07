@@ -1,5 +1,6 @@
 import 'server-only';
 import { redact, redactString } from './redact';
+import { getRequestId } from './requestContext';
 
 // Tiny structured logger. Everything passes through redact() first, so callers
 // cannot accidentally log a password, token, cookie or document body by
@@ -9,10 +10,12 @@ import { redact, redactString } from './redact';
 type Level = 'info' | 'warn' | 'error';
 
 function write(level: Level, event: string, fields?: Record<string, unknown>): void {
+  const requestId = getRequestId();
   const line = JSON.stringify({
     t: new Date().toISOString(),
     level,
     event: redactString(event),
+    ...(requestId ? { requestId } : {}),
     ...(fields ? (redact(fields) as Record<string, unknown>) : {}),
   });
   if (level === 'error') console.error(line);

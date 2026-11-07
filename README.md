@@ -1,8 +1,14 @@
 # BOUNDARY
 
-A small multi-tenant document app built to show **tenant isolation and role-based access control done carefully**, plus a test runner that proves it, and a deliberate, switchable vulnerability that the runner catches.
+[![CI](https://github.com/Ntumba9/boundary/actions/workflows/ci.yml/badge.svg)](https://github.com/Ntumba9/boundary/actions/workflows/ci.yml)
+
+**What this proves:** a user from one company can never read, write, or enumerate another company's data -- under any role, through any entry point. That claim is checked by 79 black-box authorization tests on every push (see the badge above), including a deliberate, switchable vulnerability the suite is built to catch, not just a claim in this README.
+
+A small multi-tenant document app: tenant isolation and role-based access control done carefully, raw parameterized SQL kept auditable (no ORM -- see [ADR 0001](docs/decisions/0001-raw-sql-over-orm.md)), and a test runner that proves the boundary holds instead of asserting it does.
 
 > **Disclaimer.** This is a demonstration project. It is not production-hardened and comes with no security guarantee. The threat model below lists what it does and does not try to handle.
+
+![Dashboard: Acme Corp projects, scoped to the signed-in tenant](docs/screenshots/1-dashboard.png)
 
 ---
 
@@ -12,12 +18,13 @@ A small multi-tenant document app built to show **tenant isolation and role-base
 - [Screenshots](#screenshots)
 - [Running in Docker](#running-in-docker)
 - [Architecture](#architecture)
+- [Architecture decision records](docs/decisions/README.md)
 - [Performance notes](#performance-notes)
 - [Permission matrix](#permission-matrix)
 - [Security controls](#security-controls)
 - [Threat model](#threat-model)
 - [Test runner](#test-runner)
-- [Vulnerability demo: break, detect, fix, pass](#vulnerability-demo-break-detect-fix-pass)
+- [Vulnerability demo: break, detect, fix, pass](#vulnerability-demo-break-detect-fix-pass) ([standalone walkthrough: docs/DEMO.md](docs/DEMO.md))
 - [CI](#ci)
 - [Adapting the runner to another API](#adapting-the-runner-to-another-api)
 - [Dependencies](#dependencies)
@@ -59,7 +66,7 @@ Seed data: Acme has 3 projects / 7 documents, Globex has 2 projects / 5 document
 ### Run the tests against the running dev server
 
 ```bash
-npm run test:authz            # authorization runner, safe mode: expect 71/71 PASS, exit 0
+npm run test:authz            # authorization runner, safe mode: expect 79/79 PASS, exit 0
 npm run test:smoke            # UI smoke tests (server-rendered HTML checks)
 npm run test:e2e              # Playwright browser tests (one-time: npx playwright install chromium)
 npm run test:unit             # pure unit tests, no server needed
@@ -91,9 +98,17 @@ The admin panel - user and project management, enforced server-side per tenant:
 
 ![Admin panel](docs/screenshots/4-admin.png)
 
-The [test runner](#test-runner) renders its latest output at `/results` (screenshot predates the audit-log test group added since; see [Cases](#cases) for the current count):
+The [test runner](#test-runner) renders its latest output at `/results` -- 79/79 passing, including the admin-audit-log and request-correlation-id groups:
 
-![Authorization test runner output](docs/screenshots/5-test-results.png)
+![Authorization test runner output: 79/79 passing](docs/screenshots/5-test-results.png)
+
+The same page in [unsafe demo mode](docs/DEMO.md): the tenant filter removed from one query, caught as exactly one intentional failure, nothing else affected:
+
+![A Globex member viewing an Acme document directly by id in unsafe demo mode](docs/screenshots/6-unsafe-demo.png)
+
+![Results page in unsafe-demo mode: 78/79, case 1.1 highlighted as the intentional failure](docs/screenshots/7-unsafe-results.png)
+
+See [docs/DEMO.md](docs/DEMO.md) for the full break-detect-fix-pass walkthrough with exact commands.
 
 ---
 
@@ -251,6 +266,7 @@ Pages follow the same policy: a member opening `/admin` gets an HTTP 403 page (`
 | 9 | zod validation on every mutation | `src/lib/validation.ts` + `parseJson` in `src/lib/api.ts` |
 | 10 | Authenticated API responses send `Cache-Control: no-store`; JSON bodies are hard-capped at 64 KB (413), including chunked bodies with no declared length | `src/lib/api.ts` |
 | 11 | Admin mutations (create user, change role, set active) are rate-limited per (company, actor), and write a tenant-scoped audit entry in the same transaction as the mutation | `src/lib/auth/adminThrottle.ts`, `src/lib/services/auditLog.ts`, `src/lib/services/users.ts` |
+| 12 | Every response carries `X-Request-ID`. An incoming id is validated and bounded before reuse; an invalid one is replaced, never reflected. Error bodies carry the same id as the header | `src/lib/requestId.ts`, `src/lib/requestContext.ts`, `src/lib/api.ts` |
 
 ### Sessions
 
@@ -296,6 +312,15 @@ Every call to create a user, change a role, or activate/deactivate a user writes
 
 `src/lib/log.ts` writes one JSON line per event, and every field passes through `redact()`. Keys matching `password|token|secret|cookie|authorization|csrf|session|body|hash` become `[REDACTED]`, and any 64-hex-char token inside a string is masked. Callers log ids and outcomes, never payloads. Login events do include the email address (useful for spotting abuse). Remove it if you treat emails as sensitive.
 
+### Request correlation ids (X-Request-ID)
+
+Every response -- success or error, authenticated or not -- carries an `X-Request-ID` header, so a single request can be found across the logs it produced.
+
+- **The id is assigned before anything else runs:** `authed()` and `publicRoute()` in `src/lib/api.ts` resolve it first, then run the rest of the request (session resolution, CSRF check, the handler, and any thrown error) inside `runWithRequestId()` (`src/lib/requestContext.ts`), which uses Node's `AsyncLocalStorage` to make the id available to `log.ts` automatically. No call site had to change: all ten existing `log.*` calls across the app pick up `requestId` in their output without passing it explicitly.
+- **An incoming id is untrusted input, not a convenience.** `resolveRequestId()` (`src/lib/requestId.ts`) accepts a client- or gateway-supplied `X-Request-ID` only if it is 1-128 characters from `[A-Za-z0-9._-]`; anything missing, oversized, or outside that set is discarded and a fresh `crypto.randomUUID()` is generated instead. The id is never truncated and reused -- that would risk silently merging two different callers' ids -- and it is never logged or echoed back unvalidated, which is what would make this header a log- or header-injection vector in the first place. (A literal CR/LF in the header value is also rejected by the HTTP client layer itself -- see `test-runner/cases.ts` group 10 -- so the validation here is the second, server-side layer, not the only one.)
+- **Error responses carry the same id as the header**, in the JSON body (`{"error": "...", "requestId": "..."}`), never a stack trace. A user reporting "I got an error" can hand back that one value and it is directly `grep`-able in the server logs.
+- **No new dependency and no logging rewrite.** This uses only `node:async_hooks` and `node:crypto`, both built in. The change is additive: two small new modules, a few lines in `src/lib/api.ts` and `src/lib/log.ts`, and no change to any of the existing call sites that log.
+
 ### Content-Security-Policy
 
 Pages get a **nonce-based CSP** generated per request in `src/proxy.ts` (Next 16's renamed middleware):
@@ -329,6 +354,7 @@ base-uri 'self'; form-action 'self'; frame-ancestors 'none'
 - **CSRF** against cookie-authenticated mutations.
 - **Online password guessing** (basic throttling only).
 - **Secrets in logs** (redaction).
+- **Request traceability without a new leak:** an incoming correlation id is validated and bounded, never trusted or reflected unsafely (see [Request correlation ids](#request-correlation-ids-x-request-id)).
 
 **Explicitly out of scope:**
 - XSS hardening beyond React's default escaping and the nonce-based CSP above (no Trusted Types, no CSP violation reporting endpoint).
@@ -349,7 +375,7 @@ This is not production-hardened. "All tests pass" means the specific behaviours 
 | File | Purpose |
 |------|---------|
 | `run.ts` | CLI: target checks, health check, mode detection, runs groups, prints and writes `test-results.json` |
-| `cases.ts` | The 71 cases in 9 groups (below) |
+| `cases.ts` | The 79 cases in 10 groups (below) |
 | `adapter.ts` | **Endpoint adapter**: the typed interface plus `BoundaryHttpAdapter`, written for this app's HTTP API |
 | `fixtures.ts` | Hardcoded identities and IDs (imported from `scripts/seed-data.ts`), DB reset, direct-DB fixture helper |
 | `safe-http.ts` | `fetch` with `redirect: 'manual'`; follows same-origin redirects itself and refuses any cross-origin hop |
@@ -359,7 +385,7 @@ This is not production-hardened. "All tests pass" means the specific behaviours 
 
 **Fixtures are explicit.** Emails, the demo password, project ids and document ids are hardcoded in `scripts/seed-data.ts` and imported by the runner. Nothing is discovered at runtime.
 
-**Isolation.** Before each of the 8 groups the runner reseeds the local database (`scripts/seed.ts`: truncate and insert), so groups don't depend on each other and runs are repeatable. Users created during a case (second member, second admin) disappear at the next reset. Reset refuses to run unless `DATABASE_URL` points at `localhost`/`127.0.0.1`/`::1`.
+**Isolation.** Before each of the 10 groups the runner reseeds the local database (`scripts/seed.ts`: truncate and insert), so groups don't depend on each other and runs are repeatable. Users created during a case (second member, second admin) disappear at the next reset. Reset refuses to run unless `DATABASE_URL` points at `localhost`/`127.0.0.1`/`::1`.
 
 **Target safety.** Loopback is the default and the only thing allowed out of the box. Any other host must be added to `AUTHORIZED_REMOTE_HOSTS` in `test-runner/config.ts` (a reviewable code change) **and** the run needs `--i-am-authorized`. Non-local runs also need `--no-reset` (the runner can't reset a remote DB, so DB-level cases are skipped). Redirects are never auto-followed. A redirect to a different origin aborts the request.
 
@@ -380,6 +406,7 @@ This is not production-hardened. "All tests pass" means the specific behaviours 
 | 7. Positive controls | Same-company read 200, list 200, owner edit 200, member create 201 (owner and company derived from session), admin create user 201, admin override edit 200, admin create/delete project, owner delete 200, Globex reads its own doc 200 |
 | 8. Defense extras | `company_id` / `owner_user_id` in body → 400; missing/wrong CSRF → 403; no/forged session → 401; empty title → 400; 6th failed login → 429; oversized body (declared-length and chunked) → 413; logout clears cookies even on an expired session but still needs CSRF on a live one; 12 parallel failed logins still lock exactly once (no lost updates, no 500s) |
 | 9. Admin audit log and rate limiting | Successful create/role-change/deactivate each write one audit entry with correct old/new values; a rolled-back mutation (duplicate email) leaves no entry; a forbidden (member) or cross-tenant attempt leaves no entry **and** no mutation; the read endpoint is admin-only and tenant-isolated; 15 parallel mutations from one fresh admin → exactly 10 succeed, the rest 429 |
+| 10. Request correlation ids | Every response carries `X-Request-ID`, success or error; a well-formed caller-supplied id is echoed back; an id outside the safe character set, or over 128 characters, is replaced rather than reflected or truncated; a 404 and a 400 both carry the same id in the header and the JSON error body; a request with no session (401) still gets one; two requests with no client-supplied id never collide |
 
 **Why positive controls matter.** Expected statuses are exact. A server that answers 403/404 to everything would pass groups 1-3 but fail group 7 and every precondition check (2.8, 2.9, 3.8, 3.9, 4.4, 5.1, 6.1, ...). Deny-all shows up as a failing run, not as a way to fake a pass.
 
@@ -412,10 +439,12 @@ It's environment-only: no UI, no API, nothing in `.env.example`. `npm run dev:un
 
 ### Live walkthrough (about 3 minutes)
 
+Also written up as a standalone, copy-pasteable script with screenshots and a recording checklist: [docs/DEMO.md](docs/DEMO.md).
+
 ```bash
 # 0. Baseline: safe server, everything passes
 npm run dev                       # terminal 1
-npm run test:authz                # terminal 2 → "71/71 passed", exit 0
+npm run test:authz                # terminal 2 → "79/79 passed", exit 0
 
 # 1. BREAK: restart the server in unsafe demo mode
 #    (Ctrl+C in terminal 1)
@@ -427,7 +456,7 @@ npm run dev:unsafe                # big warning banner in the server log
 
 # 2. DETECT: the runner catches it
 npm run test:authz:unsafe         # → banner: "vulnerability DETECTED as designed"
-                                  #   exactly 1 failure (1.1), 56 passes, exit 1
+                                  #   exactly 1 failure (1.1), 78 passes, exit 1
 #    Open http://localhost:3000/results → case 1.1 highlighted as intentional failure.
 #    (Running plain `npm run test:authz` against this server refuses with exit 2:
 #     the runner will not silently test an unsafe server as if it were safe.)
@@ -437,7 +466,7 @@ npm run test:authz:unsafe         # → banner: "vulnerability DETECTED as desig
 npm run dev
 
 # 4. PASS
-npm run test:authz                # → 71/71 passed, exit 0
+npm run test:authz                # → 79/79 passed, exit 0
 ```
 
 Talking points: the bug is a single missing `AND company_id = $2`, which is the most common real-world multi-tenant bug (broken object-level authorization). Random UUIDs wouldn't have saved it (an id can leak through a URL, a log or a shared link). The positive controls prove the fix isn't "deny everything". Every other control (writes, role checks, listings) kept working because each query enforces tenancy on its own.
@@ -505,7 +534,7 @@ Not used: Tailwind or any CSS framework (plain CSS in `src/app/globals.css`, mob
 
 ## What is covered by tests, honestly
 
-- **Authorization runner (71 cases)**: black-box integration tests over HTTP against a real server and a real Postgres. This is the main evidence.
+- **Authorization runner (79 cases)**: black-box integration tests over HTTP against a real server and a real Postgres. This is the main evidence.
 - **UI smoke tests (14 checks)**: fetch server-rendered HTML and string-match: login form renders, anonymous `/dashboard` redirects to `/login`, each of the 4 users sees only their own company and role, member `/admin` is HTTP 403, foreign project/document pages are 404 with no leaked content, the owner sees the editor and a non-owner doesn't, `/results` renders. They don't run JavaScript or click anything.
 - **Unit tests (16, `node:test`)**: the permission functions, the unsafe-mode guard (every combination that must stay off), log redaction, and the runner's target allowlist.
 - **Browser e2e tests (7, Playwright, Chromium, `e2e/`)**: login through the real form (success, and wrong password showing the generic error with no session created), the dashboard showing the right company and role, no admin entry point for a member, a member opening `/admin` directly getting a real HTTP 403 page with no user list behind it, another company's document and project URLs returning 404 with no leaked content, a project page listing only own-company documents, and the CSP: correct header shape plus zero CSP violations while logging in, navigating client-side and opening the document editor. `globalSetup` reseeds the database and refuses non-local targets.
@@ -530,6 +559,7 @@ Partially done: `e2e/` covers the read-side flows above. Next steps would be spe
 - On shutdown the pool is closed alongside Next's request drain, not strictly after it (trade-off explained in `src/instrumentation.ts`).
 - The unsafe-mode Host check trusts the `Host` header (it's an accident guard, not a security control).
 - Single process, single database; nothing here was load-tested.
+- `X-Request-ID` is a per-process, single-log-stream correlation id, not a distributed trace: it's enough to `grep` one request's log lines on one server, not a W3C `traceparent`-style propagation across multiple services.
 
 Again: this is a teaching and interview project. It demonstrates specific controls and proves them with tests. It makes no claim of being secure in general.
 

@@ -689,4 +689,130 @@ export const GROUPS: CaseGroup[] = [
       });
     },
   },
+  {
+    id: '10',
+    title: 'Request correlation ids (X-Request-ID)',
+    async run(ctx) {
+      const member = await ctx.login('acme-member', A.acmeMember.email);
+      const idRe = /^[A-Za-z0-9._-]{1,128}$/;
+
+      // --- success path: every authenticated response carries one ---------
+      const ok = await ctx.api.raw(member, 'GET', '/api/me');
+      ctx.check({
+        id: '10.1',
+        name: 'A normal authenticated response carries X-Request-ID',
+        expected: 200,
+        res: ok,
+        extra: { ok: !!ok.requestId && idRe.test(ok.requestId), detail: `requestId: ${JSON.stringify(ok.requestId)}` },
+        explanation: 'authed() stamps X-Request-ID on every response, success or failure.',
+      });
+
+      // --- a well-formed caller-supplied id is honored verbatim -----------
+      const clientId = 'client-supplied-id-123';
+      const echoed = await ctx.api.raw(member, 'GET', '/api/me', { extraHeaders: { 'x-request-id': clientId } });
+      ctx.check({
+        id: '10.2',
+        name: 'A well-formed caller-supplied X-Request-ID is echoed back',
+        expected: 200,
+        res: echoed,
+        extra: { ok: echoed.requestId === clientId, detail: `sent ${clientId}, got back ${JSON.stringify(echoed.requestId)}` },
+        explanation: 'A safe, bounded id from the caller is trusted for correlation across a gateway or load balancer.',
+      });
+
+      // --- an unsafe caller-supplied id is never reflected -----------------
+      // A literal CR/LF can't even be placed in this request: the Fetch
+      // standard's header-value validation (undici here, every browser too)
+      // refuses to send one -- that part of the injection vector is already
+      // closed by the HTTP client, not by this app. What a conformant client
+      // CAN send is a value with other characters outside the app's safe set
+      // (spaces, quotes, markup); this proves the server validates on its own
+      // and does not just rely on well-behaved clients.
+      const injected = await ctx.api.raw(member, 'GET', '/api/me', {
+        extraHeaders: { 'x-request-id': 'not safe; has "quotes" <tags> and spaces' },
+      });
+      ctx.check({
+        id: '10.3',
+        name: 'An unsafe caller-supplied X-Request-ID (outside the safe character set) is replaced, never reflected',
+        expected: 200,
+        res: injected,
+        extra: {
+          ok: !!injected.requestId && idRe.test(injected.requestId),
+          detail: `got back ${JSON.stringify(injected.requestId)}`,
+        },
+        explanation: 'The incoming id is validated against a safe character set before reuse; an unsafe value is discarded and a fresh server id is generated, so it can never inject a header or a log line.',
+      });
+
+      const tooLong = await ctx.api.raw(member, 'GET', '/api/me', { extraHeaders: { 'x-request-id': 'x'.repeat(200) } });
+      ctx.check({
+        id: '10.4',
+        name: 'An over-length caller-supplied X-Request-ID is replaced, not truncated and reused',
+        expected: 200,
+        res: tooLong,
+        extra: {
+          ok: !!tooLong.requestId && idRe.test(tooLong.requestId) && tooLong.requestId.length <= 128,
+          detail: `got back length ${tooLong.requestId?.length ?? 'null'}`,
+        },
+        explanation: "Oversized ids are rejected outright rather than truncated, which would silently merge two different callers' ids.",
+      });
+
+      // --- error paths still carry the id, in both the header and the body ---
+      // A well-formed but guaranteed-unseeded UUID: a clean 404, not a
+      // different-shape "not a UUID" 404 (see src/lib/errors.ts, isUuid).
+      const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+      const notFound = await ctx.api.raw(member, 'GET', `/api/documents/${NIL_UUID}`);
+      const notFoundBody = notFound.body as { requestId?: string } | null;
+      ctx.check({
+        id: '10.5',
+        name: '404 response still carries X-Request-ID, matching in header and body',
+        expected: 404,
+        res: notFound,
+        extra: {
+          ok: !!notFound.requestId && notFoundBody?.requestId === notFound.requestId,
+          detail: `header=${JSON.stringify(notFound.requestId)} body=${JSON.stringify(notFoundBody?.requestId)}`,
+        },
+        explanation: 'errorResponse() stamps the same id used for the header into the JSON error body, so a reported failure can be found in the logs by that id alone.',
+      });
+
+      const validation = await ctx.api.raw(member, 'POST', `/api/projects/${P.acmeAnvil.id}/documents`, {
+        body: { title: '', body: 'x' },
+      });
+      const validationBody = validation.body as { requestId?: string } | null;
+      ctx.check({
+        id: '10.6',
+        name: '400 validation failure still carries X-Request-ID, matching in header and body',
+        expected: 400,
+        res: validation,
+        extra: {
+          ok: !!validation.requestId && validationBody?.requestId === validation.requestId,
+          detail: `header=${JSON.stringify(validation.requestId)} body=${JSON.stringify(validationBody?.requestId)}`,
+        },
+        explanation: 'zod validation errors go through the same errorResponse() path, so they carry the id too.',
+      });
+
+      const unauthenticated = await ctx.api.raw(null, 'GET', '/api/projects');
+      ctx.check({
+        id: '10.7',
+        name: '401 (no session) still carries X-Request-ID',
+        expected: 401,
+        res: unauthenticated,
+        extra: { ok: !!unauthenticated.requestId && idRe.test(unauthenticated.requestId), detail: `requestId: ${JSON.stringify(unauthenticated.requestId)}` },
+        explanation: 'The id is assigned before authentication runs, so even a rejected request is traceable.',
+      });
+
+      // --- generated ids are not a static or predictable value -------------
+      const a = await ctx.api.raw(member, 'GET', '/api/me');
+      const b = await ctx.api.raw(member, 'GET', '/api/me');
+      ctx.check({
+        id: '10.8',
+        name: 'Two requests with no client-supplied id get two different generated ids',
+        expected: 200,
+        res: b,
+        extra: {
+          ok: !!a.requestId && !!b.requestId && a.requestId !== b.requestId,
+          detail: `a=${JSON.stringify(a.requestId)} b=${JSON.stringify(b.requestId)}`,
+        },
+        explanation: 'Each request gets its own fresh id; it is never a fixed or reused value.',
+      });
+    },
+  },
 ];

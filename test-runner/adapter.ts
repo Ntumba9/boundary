@@ -15,6 +15,8 @@ import { safeFetch } from './safe-http.ts';
 export interface ApiResult<T = unknown> {
   status: number;
   body: T | null;
+  /** The X-Request-ID response header, when present. Used only by the correlation-id cases. */
+  requestId?: string | null;
 }
 
 /** An authenticated client identity. Holds cookies in memory only; never printed or written to disk. */
@@ -67,6 +69,8 @@ export interface RawOptions {
   csrf?: 'session' | 'omit' | { value: string };
   /** Replace the session cookie value (forged-token test). */
   sessionCookieOverride?: string;
+  /** Extra request headers, merged in last (used by the correlation-id cases to send a caller-supplied X-Request-ID). */
+  extraHeaders?: Record<string, string>;
 }
 
 const SESSION_COOKIE = 'boundary_session';
@@ -93,6 +97,7 @@ export class BoundaryHttpAdapter implements AuthzTargetAdapter {
         else if (csrf !== 'omit') headers['x-csrf-token'] = csrf.value;
       }
     }
+    if (opts.extraHeaders) Object.assign(headers, opts.extraHeaders);
     let reqBody: string | ReadableStream<Uint8Array> | undefined;
     if (opts.body !== undefined) {
       const text = JSON.stringify(opts.body);
@@ -120,7 +125,7 @@ export class BoundaryHttpAdapter implements AuthzTargetAdapter {
         body = null;
       }
     }
-    return { status: res.status, body: body as T };
+    return { status: res.status, body: body as T, requestId: res.headers.get('x-request-id') };
   }
 
   health() {
